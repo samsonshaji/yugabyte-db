@@ -47,9 +47,13 @@
 #include "yb/rpc/messenger.h"
 #include "yb/rpc/proxy.h"
 #include "yb/rpc/rpc_controller.h"
+#include "yb/tablet/tablet.h"
+#include "yb/tablet/tablet_peer.h"
 
 #include "yb/tserver/mini_tablet_server.h"
 #include "yb/tserver/tablet_server.h"
+#include "yb/tserver/ts_tablet_manager.h"
+#include "yb/tserver/tserver_types.pb.h"
 #include "yb/tserver/tserver_service.proxy.h"
 
 #include "yb/util/backoff_waiter.h"
@@ -82,6 +86,8 @@ DECLARE_int32(tserver_heartbeat_metrics_interval_ms);
 DECLARE_int32(tablet_report_limit);
 DECLARE_int32(replication_factor);
 DECLARE_uint64(TEST_inject_latency_during_tablet_report_ms);
+DECLARE_bool(enable_tiered_storage);
+DECLARE_int32(tier_migration_reconcile_interval_sec);
 
 METRIC_DECLARE_histogram(handler_latency_yb_master_MasterHeartbeat_TSHeartbeat);
 
@@ -780,6 +786,73 @@ TEST_F(MasterHeartbeatITestPersistedRegistry, RegistrationCarriesStorageTiers) {
   ASSERT_OK(waited);
 
   ASSERT_OK(StartAllTServers(mini_cluster_.get()));
+}
+
+class TierStateHeartbeatTest : public MasterHeartbeatITest {
+ public:
+  void SetUp() override {
+    // Both are read when the tservers start: the tier fields are reported only with the preview
+    // flag on, and the reconciler's verdict is what moves a replica to DONE.
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_tiered_storage) = true;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_tier_migration_reconcile_interval_sec) = 1;
+    MasterHeartbeatITest::SetUp();
+  }
+};
+
+// A replica's tier, target and migration state reach the master through the tablet report: at
+// creation, when AlterTabletTier records a target, and when the reconciler's verdict follows.
+TEST_F(TierStateHeartbeatTest, TierStateReachesMaster) {
+  CreateTable();
+  auto& catalog_mgr = ASSERT_RESULT(mini_cluster_->GetLeaderMiniMaster())->catalog_manager();
+  auto table_info = catalog_mgr.GetTableInfoFromNamespaceNameAndTableName(
+      table_name().namespace_type(), table_name().namespace_name(), table_name().table_name());
+  auto tablets = ASSERT_RESULT(table_info->GetTablets());
+  ASSERT_FALSE(tablets.empty());
+
+  // A default cluster has unlabeled data dirs, so every replica is born on kDefaultStorageTier
+  // with no target, and nothing has looked at it.
+  const auto num_replicas = mini_cluster_->num_tablet_servers();
+  ASSERT_OK(WaitFor([&]() -> Result<bool> {
+    for (const auto& tablet : tablets) {
+      auto replicas = tablet->GetReplicaLocations();
+      if (replicas->size() != num_replicas) {
+        return false;
+      }
+      for (const auto& [ts_uuid, replica] : *replicas) {
+        if (replica.current_storage_tier != kDefaultStorageTier ||
+            !replica.target_storage_tier.empty() ||
+            replica.tier_migration_state != tserver::TierMigrationStatusPB::NONE) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }, 30s, "every replica to report its tier"));
+
+  // Record a target on one replica. The only tier here is the home one, so the replica is on its
+  // target already and the reconciler declares it DONE on its next pass.
+  const auto& tablet = tablets.front();
+  auto* mini_ts = mini_cluster_->mini_tablet_server(0);
+  auto peer = ASSERT_RESULT(mini_ts->server()->tablet_manager()->GetTablet(tablet->tablet_id()));
+  auto ts_tablet = ASSERT_RESULT(peer->shared_tablet());
+  ASSERT_RESULT(ts_tablet->AlterTabletTier(kDefaultStorageTier, /* target_path_id= */ 0));
+  const auto ts_uuid = mini_ts->server()->permanent_uuid();
+  ASSERT_OK(WaitFor([&]() -> Result<bool> {
+    auto replicas = tablet->GetReplicaLocations();
+    auto it = replicas->find(ts_uuid);
+    if (it == replicas->end()) {
+      return false;
+    }
+    const auto& replica = it->second;
+    return replica.target_storage_tier == kDefaultStorageTier &&
+           replica.current_storage_tier == kDefaultStorageTier &&
+           replica.tier_migration_state == tserver::TierMigrationStatusPB::DONE;
+  }, 30s, "the master to see the target and the reconciler's verdict"));
+  for (const auto& [uuid, replica] : *tablet->GetReplicaLocations()) {
+    if (uuid != ts_uuid) {
+      ASSERT_TRUE(replica.target_storage_tier.empty()) << replica.ToString();
+    }
+  }
 }
 
 class DriveInfoTest : public MasterHeartbeatITest {
