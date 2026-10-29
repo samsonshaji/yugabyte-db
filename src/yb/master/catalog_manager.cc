@@ -12356,6 +12356,16 @@ Result<std::shared_ptr<AsyncAddServerTask>> CatalogManager::ScheduleAddServerTas
   return task;
 }
 
+Result<std::shared_ptr<RetryingRpcTask>> CatalogManager::ScheduleAlterTabletTierTask(
+    const TabletInfoPtr& tablet, const TabletServerId& ts_uuid, const std::string& target_tier,
+    const LeaderEpoch& epoch, const std::string& reason) {
+  auto task = std::make_shared<AsyncAlterTabletTier>(
+      master_, AsyncTaskPool(), tablet, ts_uuid, target_tier, epoch, reason);
+  tablet->table()->AddTask(task);
+  RETURN_NOT_OK(ScheduleTask(task));
+  return task;
+}
+
 void CatalogManager::ExtractTabletsToProcess(
     TabletInfos *tablets_to_delete,
     TableToTabletInfos *tablets_to_process) {
@@ -13431,6 +13441,13 @@ Status CatalogManager::BuildLocationsForTablet(
       replica_pb->set_role(tablet_replica.role);
       replica_pb->set_member_type(tablet_replica.member_type);
       replica_pb->set_state(tablet_replica.state);
+      if (!tablet_replica.current_storage_tier.empty()) {
+        replica_pb->set_current_storage_tier(tablet_replica.current_storage_tier);
+      }
+      if (!tablet_replica.target_storage_tier.empty()) {
+        replica_pb->set_target_storage_tier(tablet_replica.target_storage_tier);
+        replica_pb->set_tier_migration_state(tablet_replica.tier_migration_state);
+      }
       TSInfoPB* out_ts_info = replica_pb->mutable_ts_info();
       out_ts_info->set_permanent_uuid(ts_uuid);
       auto strong_ts_desc_ptr = tablet_replica.ts_desc.lock();
